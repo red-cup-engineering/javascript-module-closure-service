@@ -1,0 +1,30 @@
+{
+  "name": "@red-cup-engineering/javascript-module-closure-service",
+  "version": "0.1.0",
+  "description": "The code a computation runs, as one identity: capture a JavaScript module closure, digest and admit it, and execute a program from it.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "files": ["src"],
+  "exports": {
+    ".": "./src/module-closure.mjs",
+    "./execute-javascript-program": {
+      "workerd": "./src/execute-javascript-program.workerd.mjs",
+      "default": "./src/module-closure.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@red-cup-engineering/computer-content-engineering-services-section": "0.1.0",
+    "@red-cup-engineering/javascript-parser-service": "0.1.0",
+    "@red-cup-engineering/json-schema-services-section": "0.5.0",
+    "@red-cup-engineering/json-services-section": "0.4.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/red-cup-engineering/computer-code-engineering-services-section.git",
+    "directory": "services/javascript-engineering-services-section/services/javascript-node-services-section/services/javascript-module-closure-service"
+  }
+}
