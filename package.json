@@ -4,7 +4,9 @@
   "description": "The code a computation runs, as one identity: capture a JavaScript module closure, digest and admit it, and execute a program from it.",
   "type": "module",
   "license": "UNLICENSED",
-  "files": ["src"],
+  "files": [
+    "src"
+  ],
   "exports": {
     ".": "./src/module-closure.mjs",
     "./execute-javascript-program": {
