@@ -13,13 +13,12 @@ import moduleParameterizationSchema from "@red-cup-engineering/computer-content-
  */
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { builtinModules, findPackageJSON, registerHooks, createRequire } from "node:module";
+import { isBuiltin, findPackageJSON, registerHooks, createRequire } from "node:module";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { canonicalJson } from "@red-cup-engineering/json-services-section";
 import { parseJavaScript, walkJavaScript } from "@red-cup-engineering/javascript-parser-service";
 
-const BUILTIN = new Set(builtinModules);
 const CONDITIONS = ["node", "import", "default"];
 
 function packageOf(file) {
@@ -105,7 +104,7 @@ function installedLegacyMain(root, main) {
 }
 
 function resolveSpecifier(specifier, from, includeInstalled = false, sourceMode, sourcePackages) {
-  if (specifier.startsWith("node:") || BUILTIN.has(specifier.split("/")[0])) return null;
+  if (isBuiltin(specifier)) return null;
   if (includeInstalled && sourceMode === "require") {
     try { return { file: createRequire(pathToFileURL(from)).resolve(specifier) }; }
     catch { return { external: `unresolved:${specifier}` }; }
@@ -146,7 +145,7 @@ function resolveSpecifier(specifier, from, includeInstalled = false, sourceMode,
     const packageName = target.startsWith("@") ? packageParts.slice(0, 2).join("/") : packageParts[0];
     if (!packageName || packageName.includes("%") || target.startsWith("@") && (!packageParts[0].slice(1) || !packageParts[1]))
       return { external: `invalid-import-target:${specifier}` };
-    if (BUILTIN.has(target.split("/")[0])) return { builtin: `node:${target}` };
+    if (isBuiltin(target)) return { builtin: `node:${target}` };
     return resolveSpecifier(target, join(root, "package.json"), includeInstalled, sourceMode, sourcePackages);
   }
   const parts = specifier.split("/");
@@ -327,7 +326,7 @@ export function captureModuleClosure(entry) {
     origins[key] = pathToFileURL(file).href;
     for (const {specifier, mode} of importsOf(file, bytes.toString("utf8"), true)) {
       const requestKey = mode === "require" ? `require:${specifier}` : specifier;
-      if (specifier.startsWith("node:") || BUILTIN.has(specifier.split("/")[0])) {
+      if (isBuiltin(specifier)) {
         imports[requestKey] = specifier.startsWith("node:") ? specifier : `node:${specifier}`;
         continue;
       }
@@ -358,7 +357,7 @@ export function admitModuleClosure(id, material, originBindings = {}) {
     if (!["module", "commonjs", "json"].includes(module.format) || byteAddress(Buffer.from(module.source, "base64")) !== module.content)
       throw new TypeError("JavaScript programme source address mismatch");
     for (const target of Object.values(module.imports)) {
-      if (!Object.hasOwn(body.modules, target) && !(target.startsWith("node:") && BUILTIN.has(target.slice(5))))
+      if (!Object.hasOwn(body.modules, target) && !(target.startsWith("node:") && isBuiltin(target)))
         throw new TypeError("JavaScript programme import leaves its admitted closure");
     }
     origins[key] = originBindings[key] ?? pathToFileURL(resolve("/.561-programmes", id.slice(id.lastIndexOf(";") + 1), key)).href;
