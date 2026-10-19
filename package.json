@@ -26,7 +26,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/red-cup-engineering/computer-code-engineering-services-section.git",
-    "directory": "services/javascript-engineering-services-section/services/javascript-node-services-section/services/javascript-module-closure-service"
+    "url": "git+https://github.com/red-cup-engineering/javascript-module-closure-service.git"
   }
 }
