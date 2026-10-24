@@ -21,8 +21,8 @@
   "dependencies": {
     "@red-cup-engineering/computer-content-engineering-services-section": "0.1.0",
     "@red-cup-engineering/javascript-parser-service": "0.1.0",
-    "@red-cup-engineering/json-schema-services-section": "0.5.0",
-    "@red-cup-engineering/json-services-section": "0.4.0"
+    "@red-cup-engineering/json-schema-engineering-services-section": "0.5.0",
+    "@red-cup-engineering/json-engineering-services-section": "0.4.0"
   },
   "repository": {
     "type": "git",
