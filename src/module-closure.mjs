@@ -26,20 +26,35 @@ function packageOf(file) {
   return { root: dirname(manifest), manifest: JSON.parse(readFileSync(manifest, "utf8")) };
 }
 
-function condition(target, sourceMode, privateTarget = false) {
-  if (target === null || typeof target === "string") return target;
-  if (privateTarget && typeof target !== "object") throw new TypeError("JavaScript programme cannot admit an invalid private-import target");
+function condition(target, sourceMode, privateTarget = false, validateTarget) {
+  if (target === null || typeof target === "string") {
+    if (typeof target === "string") validateTarget?.(target);
+    return target;
+  }
+  if (privateTarget && typeof target !== "object") {
+    const error = new TypeError("JavaScript programme cannot admit an invalid private-import target");
+    if (validateTarget) error.code = "ERR_INVALID_PACKAGE_TARGET";
+    throw error;
+  }
   if (Array.isArray(target)) {
+    let lastError;
     for (const value of target) {
-      const chosen = condition(value, sourceMode, privateTarget);
+      let chosen;
+      try { chosen = condition(value, sourceMode, privateTarget, validateTarget); }
+      catch (error) {
+        if (!validateTarget || error.code !== "ERR_INVALID_PACKAGE_TARGET") throw error;
+        lastError = error; continue;
+      }
       if (chosen != null) return chosen;
+      if (chosen === null) lastError = null;
     }
-    return null;
+    if (lastError) throw lastError;
+    return validateTarget && target.length > 0 && lastError === undefined ? undefined : null;
   }
   if (privateTarget && Object.keys(target).some(key => String(Number(key)) === key && Number(key) >= 0 && Number(key) < 2 ** 32 - 1)) throw new TypeError("JavaScript programme cannot admit numeric private-import condition keys");
   const conditions = sourceMode === undefined ? CONDITIONS : Object.keys(target).filter(name => ["node", sourceMode, "module-sync", "node-addons", "default"].includes(name));
   for (const name of conditions) if (name in target) {
-    const chosen = condition(target[name], sourceMode, privateTarget);
+    const chosen = condition(target[name], sourceMode, privateTarget, validateTarget);
     if (chosen !== undefined) return chosen;
   }
   return undefined;
@@ -68,8 +83,9 @@ function mappedTarget(map, subpath, sourceMode) {
 
 // Node chooses the most-specific private pattern before interpreting its target.
 // A null or condition-absent winning target never falls through to a broader key.
-function privateImportedTarget(map, subpath, sourceMode = "import") {
-  if (!subpath.includes("*") && Object.hasOwn(map, subpath)) return condition(map[subpath], sourceMode, true) ?? null;
+function privateImportedTarget(map, subpath, sourceMode = "import", validateTarget, exportMap = false) {
+  if (!subpath.includes("*") && !(exportMap && subpath.endsWith("/")) && Object.hasOwn(map, subpath))
+    return condition(map[subpath], sourceMode, true, validateTarget) ?? null;
   const patterns = Object.keys(map).filter(pattern => {
     const star = pattern.indexOf("*");
     return star >= 0 && star === pattern.lastIndexOf("*") && subpath.length >= pattern.length && subpath.startsWith(pattern.slice(0, star)) && subpath.endsWith(pattern.slice(star + 1));
@@ -81,7 +97,7 @@ function privateImportedTarget(map, subpath, sourceMode = "import") {
   try { segments = match.split(/[\\/]/u).map(decodeURIComponent); }
   catch { throw new TypeError("JavaScript programme cannot admit malformed private-import pattern match"); }
   if (segments.some(part => [".", "..", "node_modules"].includes(part.toLowerCase()))) throw new TypeError("JavaScript programme cannot admit private-import traversal or installation pattern match");
-  return condition(map[pattern], sourceMode, true)?.replaceAll("*", match) ?? null;
+  return condition(map[pattern], sourceMode, true, validateTarget && (target => validateTarget(target.replaceAll("*", match))))?.replaceAll("*", match) ?? null;
 }
 
 function packageDirectory(name, from) {
@@ -137,7 +153,7 @@ function resolveSpecifier(specifier, from, includeInstalled = false, sourceMode,
       const url = new URL(target, pathToFileURL(root + sep));
       // This reader identifies file bytes, not distinct query/fragment module instances.
       if (url.search || url.hash) return { external: `unsupported-import-url-identity:${specifier}` };
-      return { file: fileURLToPath(url) };
+      return { file: fileURLToPath(url), ...(sourcePackages === undefined ? {} : { sourceRoot: root }) };
     }
     if (target.startsWith("/") || target.startsWith("#") || target.includes("\\") || URL.canParse(target))
       return { external: `invalid-import-target:${specifier}` };
@@ -152,34 +168,167 @@ function resolveSpecifier(specifier, from, includeInstalled = false, sourceMode,
   const name = specifier.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
   // A package may import itself by its own name.
   const own = packageOf(from);
-  const directory = own.manifest.name === name && own.manifest.exports != null ? own.root : sourcePackages === undefined ? packageDirectory(name, from) : sourcePackages.get(name)?.root ?? null;
+  const selected = sourcePackages?.(name, own);
+  const directory = own.manifest.name === name && own.manifest.exports != null ? own.root : sourcePackages === undefined ? packageDirectory(name, from) : selected?.root ?? null;
   if (directory === null) return { external: `unresolved:${specifier}` };
   const root = realpathSync(directory);
   const manifestPath = join(root, "package.json");
-  const manifest = sourcePackages?.get(name)?.manifest ?? (existsSync(manifestPath)
+  const manifest = own.manifest.name === name && own.manifest.exports != null ? own.manifest : selected?.manifest ?? (existsSync(manifestPath)
     ? JSON.parse(readFileSync(manifestPath, "utf8")) : {});
-  if (!includeInstalled && root.split(sep).includes("node_modules")) return { external: `${manifest.name}@${manifest.version}` };
+  if (!includeInstalled && sourcePackages === undefined && root.split(sep).includes("node_modules")) return { external: `${manifest.name}@${manifest.version}` };
   if (includeInstalled && manifest.exports == null && specifier === name) {
     const file = installedLegacyMain(root, manifest.main);
     return file === undefined ? { external: `unresolved:${specifier}` } : { file };
   }
-  const target = exported(manifest, specifier === name ? "." : `./${specifier.slice(name.length + 1)}`, sourceMode);
-  return target === null ? { external: `unexported:${specifier}` } : { file: resolve(root, target) };
+  const subpath = specifier === name ? "." : `./${specifier.slice(name.length + 1)}`;
+  // Installed resolution retains its existing contract. Supplied source uses the
+  // most-specific authored export and never escapes that selected package.
+  let target;
+  if (sourcePackages !== undefined && manifest.exports != null) {
+    const value = manifest.exports, keys = typeof value === "object" && !Array.isArray(value) ? Object.keys(value) : [];
+    if (keys.some(key => key.startsWith(".")) && keys.some(key => !key.startsWith(".")))
+      throw new TypeError("JavaScript programme cannot admit mixed package export keys");
+    const map = keys.some(key => key.startsWith(".")) ? value : { ".": value };
+    const validateTarget = target => {
+      const result = sourceFileTarget(target, root, specifier);
+      if (result.external) {
+        const error = new TypeError(`JavaScript programme cannot admit ${result.external}`);
+        // Only invalid package targets permit array fallback. A selected URL that
+        // this byte-identity reader cannot represent must refuse, not choose code
+        // from a later array member that Node would never reach.
+        if (result.invalidTarget) error.code = "ERR_INVALID_PACKAGE_TARGET";
+        throw error;
+      }
+    };
+    target = privateImportedTarget(map, subpath, sourceMode, validateTarget, true);
+  } else target = exported(manifest, subpath, sourceMode);
+  if (target == null) return { external: `unexported:${specifier}` };
+  if (sourcePackages !== undefined) {
+    if (typeof target !== "string") return { external: `invalid-export-target:${specifier}` };
+    return sourceFileTarget(target.startsWith("./") ? target : `./${target}`, root, specifier);
+  }
+  return { file: resolve(root, target) };
 }
 
-/** Resolve an ESM interface against the admitted source packages, without installation.
- * The caller derives these packages from authenticated Git manifests; this
- * catalogue supplies locations, never substitute export declarations.
+function sourceFileTarget(target, root, specifier) {
+  if (!target.startsWith("./")) return { external: `invalid-source-target:${specifier}`, invalidTarget: true };
+  let segments;
+  try { segments = target.slice(2).split(/[\\/]/u).map(decodeURIComponent); }
+  catch { return { external: `malformed-source-url:${specifier}` }; }
+  if (/%2f|%5c/iu.test(target)) return { external: `encoded-source-separator:${specifier}` };
+  if (segments.some(part => [".", "..", "node_modules"].includes(part.toLowerCase())))
+    return { external: `invalid-source-target:${specifier}`, invalidTarget: true };
+  const url = new URL(target, pathToFileURL(root + sep));
+  if (url.search || url.hash) return { external: `unsupported-import-url-identity:${specifier}` };
+  return { file: fileURLToPath(url), sourceRoot: root };
+}
+
+/** Resolve ESM against supplied source instances, without installation.
+ * Each optional bindings map selects dependency names by an admitted package root.
+ * Repeated names require this importer-specific selection; roots preserve distinct
+ * same-version contexts. Manifests are actual source, not substitute declarations.
+ * Authentication of bytes/lock bindings and permission to execute remain the caller's
+ * separate obligations. This resolver is deliberately not a CommonJS resolver.
  */
 export function javascriptSourceResolver(packages) {
-  const owners = new Map();
+  const owners = new Map(), names = new Map();
   for (const item of packages) {
-    if (!item.manifest?.name || owners.has(item.manifest.name)) throw new TypeError("source interfaces require unique named package owners");
     const root = realpathSync(item.root);
-    if (JSON.stringify(JSON.parse(readFileSync(join(root, "package.json"), "utf8"))) !== JSON.stringify(item.manifest)) throw new TypeError("source catalogue differs from actual package manifest");
-    owners.set(item.manifest.name, { root, manifest: item.manifest });
+    if (!item.manifest?.name || owners.has(root)) throw new TypeError("source interfaces require distinct named package roots");
+    const manifestText = JSON.stringify(item.manifest);
+    if (JSON.stringify(JSON.parse(readFileSync(join(root, "package.json"), "utf8"))) !== manifestText) throw new TypeError("source catalogue differs from actual package manifest");
+    const owner = { root, manifest: JSON.parse(manifestText), manifestText, bindings: new Map(), explicitBindings: item.bindings !== undefined, suppliedBindings: item.bindings };
+    owners.set(root, owner);
+    names.set(owner.manifest.name, [...(names.get(owner.manifest.name) ?? []), owner]);
   }
-  return (specifier, from) => resolveSpecifier(specifier, from, false, "import", owners);
+  const legacyCatalogue = [...owners.values()].every(owner => owner.suppliedBindings === undefined)
+    && [...names.values()].every(instances => instances.length === 1);
+  function current(owner) {
+    if (realpathSync(owner.root) !== owner.root || JSON.stringify(JSON.parse(readFileSync(join(owner.root, "package.json"), "utf8"))) !== owner.manifestText)
+      throw new TypeError("source catalogue differs from actual package manifest");
+    return owner;
+  }
+  function compatible(owner, name, target) {
+    if (target.manifest.name !== name) throw new TypeError(`source binding has wrong package name: ${name}`);
+    // This source-interface contract supports literal exact declarations only.
+    // Native range/local resolution is not a semver or workspace inference here.
+    for (const field of ["dependencies", "optionalDependencies", "peerDependencies", "devDependencies"]) {
+      const declared = owner.manifest[field]?.[name];
+      if (declared !== undefined && declared !== target.manifest.version)
+        throw new TypeError(`source binding has wrong declared version or unsupported nonexact declaration: ${name}`);
+    }
+    return current(target);
+  }
+  for (const owner of owners.values()) {
+    if (owner.suppliedBindings !== undefined && (owner.suppliedBindings === null || typeof owner.suppliedBindings !== "object" || Array.isArray(owner.suppliedBindings)))
+      throw new TypeError("source bindings must map package names to admitted roots");
+    for (const [name, root] of Object.entries(owner.suppliedBindings ?? {})) {
+      if (typeof root !== "string") throw new TypeError("source binding requires an admitted package root");
+      const target = owners.get(realpathSync(root));
+      if (!target) throw new TypeError(`source binding selects an unadmitted package root: ${name}`);
+      owner.bindings.set(name, compatible(owner, name, target));
+    }
+    delete owner.suppliedBindings;
+  }
+  function ownerAt(root) {
+    const owner = owners.get(root);
+    if (owner) return current(owner);
+    // The original flat location catalogue did not require its importer to be
+    // listed. Preserve that lookup contract, without calling this new source
+    // admission or inferring a dependency selection from declaration strings.
+    if (!legacyCatalogue || root === undefined) throw new TypeError("source importer is outside the supplied package catalogue");
+    const manifestText = JSON.stringify(JSON.parse(readFileSync(join(root, "package.json"), "utf8")));
+    return { root, manifest: JSON.parse(manifestText), manifestText, bindings: new Map(), explicitBindings: false };
+  }
+  function importer(from) {
+    let root;
+    if (existsSync(from)) root = realpathSync(packageOf(from).root);
+    else {
+      // findPackageJSON first resolves its file URL and therefore refuses a
+      // not-yet-generated source. Only this missing-file planning case needs
+      // nearest existing manifest ancestry; no extension or index inference.
+      for (let directory = dirname(from); ; directory = dirname(directory)) {
+        if (existsSync(join(directory, "package.json"))) { root = realpathSync(directory); break; }
+        if (dirname(directory) === directory) break;
+      }
+    }
+    return ownerAt(root);
+  }
+  const select = (name, scope) => {
+    const owner = ownerAt(realpathSync(scope.root));
+    if (owner.manifest.name === name && owner.manifest.exports != null) return owner;
+    const bound = owner.bindings.get(name);
+    if (bound) return compatible(owner, name, bound);
+    if (owner.explicitBindings) return undefined;
+    const choices = names.get(name) ?? [];
+    if (choices.length > 1) throw new TypeError(`ambiguous source package binding: ${name}`);
+    return choices.length === 1 ? current(choices[0]) : undefined;
+  };
+  return (specifier, from, mode = "import") => {
+    if (mode !== "import") throw new TypeError("source module resolver supports import mode only");
+    from = existsSync(from) ? realpathSync(from) : resolve(from);
+    const owner = importer(from);
+    let target;
+    if (specifier.startsWith(".") || specifier.startsWith("/") || specifier.startsWith("file:")) {
+      const url = new URL(specifier, pathToFileURL(from));
+      if (url.search || url.hash) return { external: `unsupported-import-url-identity:${specifier}` };
+      target = { file: fileURLToPath(url), sourceRoot: owner.root };
+    } else target = resolveSpecifier(specifier, from, false, "import", select);
+    if (target?.file) {
+      const file = existsSync(target.file) ? realpathSync(target.file) : resolve(target.file);
+      // Check real parents as well: a missing generated product must not escape
+      // through a directory symlink merely because the product does not yet exist.
+      let parent = file;
+      while (!existsSync(parent)) parent = dirname(parent);
+      const physical = resolve(realpathSync(parent), relative(parent, file));
+      if (existsSync(physical) && statSync(physical).isDirectory()) return { external: `import-directory:${specifier}` };
+      const selected = importer(physical);
+      if (target.sourceRoot !== undefined && selected.root !== target.sourceRoot)
+        throw new TypeError("source import leaves its selected package root");
+      return { file: physical };
+    }
+    return target;
+  };
 }
 
 /** Resolve installed source without importing or evaluating its programme.
@@ -280,7 +429,17 @@ function installProgrammeLoader() {
       }
       const imports = parent.admitted.body.modules[parent.key].imports;
       const target = context.conditions?.includes("require") ? imports[`require:${specifier}`] ?? imports[specifier] : imports[specifier];
-      if (!target) throw new TypeError(`JavaScript programme has no admitted import ${JSON.stringify(specifier)} from ${parent.key}`);
+      if (!target) {
+        // An addressed executor can itself be captured. Its canonical re-entry
+        // into this same admitted graph is not an ambient dynamic import. This
+        // is graph closure, not per-module execution confinement: no different
+        // closure or alternate URL may be selected through this case.
+        const entry = sourceContext(specifier);
+        if (entry && entry.closure === parent.closure
+          && specifier === moduleUrl(entry.closure, entry.key, entry.admitted))
+          return { url: specifier, format: entry.admitted.body.modules[entry.key].format, shortCircuit: true };
+        throw new TypeError(`JavaScript programme has no admitted import ${JSON.stringify(specifier)} from ${parent.key}`);
+      }
       if (target.startsWith("node:")) return next(target, context);
       return { url: moduleUrl(parent.closure, target, parent.admitted), format: parent.admitted.body.modules[target].format, shortCircuit: true };
     },
@@ -297,8 +456,11 @@ function installProgrammeLoader() {
 
 /** Capture imports as data without trusting the ESM cache. Distinct package installations
  * retain their dependency context and module lifetime, even when source bytes coincide. */
-export function captureModuleClosure(entry) {
-  const start = realpathSync(entry instanceof URL || String(entry).startsWith("file:") ? fileURLToPath(entry) : entry);
+export function captureModuleClosure(entry, { resolve: resolveImport = javascriptInstalledResolver() } = {}) {
+  if (typeof resolveImport !== "function") throw new TypeError("JavaScript programme requires a module resolver");
+  const entryURL = entry instanceof URL ? entry : String(entry).startsWith("file:") ? new URL(entry) : null;
+  if (entryURL?.search || entryURL?.hash) throw new TypeError("JavaScript programme cannot capture unsupported entry URL identity");
+  const start = realpathSync(entryURL ? fileURLToPath(entryURL) : entry);
   const modules = Object.create(null), origins = Object.create(null), paths = new Map(), packages = new Map(), pending = [start];
   function keyOf(file) {
     if (paths.has(file)) return paths.get(file);
@@ -326,11 +488,13 @@ export function captureModuleClosure(entry) {
     origins[key] = pathToFileURL(file).href;
     for (const {specifier, mode} of importsOf(file, bytes.toString("utf8"), true)) {
       const requestKey = mode === "require" ? `require:${specifier}` : specifier;
+      // The selected port sees every mode, including builtin edges. In particular
+      // an ESM-only source resolver must not admit require through this fast path.
+      const target = resolveImport(specifier, file, mode);
       if (isBuiltin(specifier)) {
         imports[requestKey] = specifier.startsWith("node:") ? specifier : `node:${specifier}`;
         continue;
       }
-      const target = resolveSpecifier(specifier, file, true, mode);
       if (target?.builtin) { imports[requestKey] = target.builtin; continue; }
       if (!target?.file) throw new TypeError(`JavaScript programme cannot admit ${specifier} from ${key}: ${target?.external ?? "missing source"}`);
       const resolved = realpathSync(target.file);
@@ -368,10 +532,10 @@ export function admitModuleClosure(id, material, originBindings = {}) {
 }
 
 /** A callable export of exact admitted bytes; no callback or verb selects its implementation. */
-export function javascriptProgram(module, exportName) {
+export function javascriptProgram(module, exportName, options) {
   if (typeof exportName !== "string" || !exportName) throw new TypeError("JavaScript programme requires a callable export name");
   const context = sourceContext(String(module));
-  const closure = context ? { id: context.closure, body: context.admitted.body } : captureModuleClosure(module);
+  const closure = context ? { id: context.closure, body: context.admitted.body } : captureModuleClosure(module, options);
   return Object.freeze({ kind: "jsnode", closure: closure.id, module: context?.key ?? closure.body.entry, export: exportName });
 }
 export function moduleClosureMaterial(id) {
