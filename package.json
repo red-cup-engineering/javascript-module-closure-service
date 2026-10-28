@@ -1,6 +1,6 @@
 {
   "name": "@red-cup-engineering/javascript-module-closure-service",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "The code a computation runs, as one identity: capture a JavaScript module closure, digest and admit it, and execute a program from it.",
   "type": "module",
   "license": "MIT",
@@ -31,5 +31,6 @@
   "funding": {
     "type": "individual",
     "url": "https://github.com/561-group/.github/blob/main/TIPS.md"
-  }
+  },
+  "private": false
 }
