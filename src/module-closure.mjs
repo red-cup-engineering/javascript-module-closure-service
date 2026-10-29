@@ -336,8 +336,24 @@ export function javascriptSourceResolver(packages) {
 export function javascriptInstalledResolver() {
   return (specifier, from, mode = "import") => {
     if (!["import", "require"].includes(mode)) throw new TypeError("installed module mode must be import or require");
+    if (mode === "import" && NODE_RESOLVES_FROM_PARENT && PACKAGE_NAME.test(specifier) && !isBuiltin(specifier)) return nodeResolved(specifier, from);
     return resolveSpecifier(specifier, from, true, mode);
   };
+}
+
+// When Node can resolve from a named parent, the closure asks Node itself which package a bare
+// name selects, so it captures exactly the module Node would load, through every registered resolve
+// hook (a source overlay among them). Relative, absolute and #private targets keep the exact checks above.
+const PACKAGE_NAME = /^(?:@[^/.#?%][^/?#%]*\/)?[^/.#?%@][^/?#%]*(?:\/[^?#%]*)?$/u;
+const NODE_RESOLVES_FROM_PARENT = [...process.execArgv, ...(process.env.NODE_OPTIONS ?? "").split(/\s+/u)]
+  .includes("--experimental-import-meta-resolve");
+
+function nodeResolved(specifier, from) {
+  let url;
+  try { url = import.meta.resolve(specifier, pathToFileURL(from).href); }
+  catch { return { external: `unresolved:${specifier}` }; }
+  if (url.startsWith("node:")) return { builtin: url };
+  return url.startsWith("file:") ? { file: fileURLToPath(url) } : { external: `unresolved:${specifier}` };
 }
 
 function importsOf(file, text, strict = false) {
